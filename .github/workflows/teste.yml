@@ -1,0 +1,9 @@
+name: Testar token Meta
+on: workflow_dispatch
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Chamar API
+        run: |
+          curl -s "https://graph.facebook.com/v21.0/act_${{ secrets.AD_ACCOUNT_ID }}/insights?fields=spend,impressions,reach&date_preset=maximum&access_token=${{ secrets.META_TOKEN }}"
