@@ -1,0 +1,68 @@
+name: Relatorio diario de trafego
+
+on:
+  schedule:
+    - cron: "0 10 * * *"   # 10:00 UTC = 07:00 na Bahia
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  relatorio:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependencias
+        run: pip install requests reportlab
+
+      - name: Coletar dados da Meta API
+        env:
+          RAW_ID: ${{ secrets.AD_ACCOUNT_ID }}
+          TOKEN: ${{ secrets.META_TOKEN }}
+        run: |
+          CLEAN_ID=$(echo "$RAW_ID" | tr -d ' ' | sed 's/^act_//')
+          echo "Coletando conta: act_${CLEAN_ID:0:4}***"
+          mkdir -p dados
+          ARQ="dados/$(date +%Y-%m-%d).json"
+          curl -sS -G "https://graph.facebook.com/v21.0/act_${CLEAN_ID}/insights" \
+            --data-urlencode "level=campaign" \
+            --data-urlencode "fields=campaign_name,spend,impressions,clicks" \
+            --data-urlencode "date_preset=yesterday" \
+            --data-urlencode "access_token=${TOKEN}" \
+            -o "$ARQ"
+          if grep -q '"error"' "$ARQ"; then
+            echo "A Meta API retornou erro:"
+            cat "$ARQ"
+            exit 1
+          fi
+          echo "Salvo em $ARQ"
+
+      - name: Gerar PDF
+        env:
+          PASTA_DADOS: dados
+        run: python gerar_relatorio.py
+
+      - name: Enviar por e-mail e Telegram
+        env:
+          EMAIL_REMETENTE: ${{ secrets.EMAIL_REMETENTE }}
+          EMAIL_SENHA_APP: ${{ secrets.EMAIL_SENHA_APP }}
+          EMAIL_DESTINO: ${{ secrets.EMAIL_DESTINO }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python enviar_relatorio.py
+
+      - name: Guardar PDF no repositorio
+        run: |
+          mkdir -p relatorios
+          cp relatorio.pdf "relatorios/relatorio_$(date +%Y-%m-%d).pdf"
+          git config user.name "bot-relatorio"
+          git config user.email "bot@relatorio"
+          git add relatorios/
+          git commit -m "Relatorio $(date +%Y-%m-%d)" || echo "nada novo"
+          git push
