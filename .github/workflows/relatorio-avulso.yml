@@ -1,0 +1,67 @@
+name: Relatorio avulso por periodo
+
+on:
+  workflow_dispatch:
+    inputs:
+      since:
+        description: "Data inicial (AAAA-MM-DD)"
+        required: true
+        default: "2026-09-04"
+      until:
+        description: "Data final (AAAA-MM-DD)"
+        required: true
+        default: "2026-09-09"
+
+permissions:
+  contents: read
+
+jobs:
+  avulso:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependencias
+        run: pip install requests reportlab
+
+      - name: Coletar dados da Meta API
+        env:
+          RAW_ID: ${{ secrets.AD_ACCOUNT_ID }}
+          TOKEN: ${{ secrets.META_TOKEN }}
+          SINCE: ${{ github.event.inputs.since }}
+          UNTIL: ${{ github.event.inputs.until }}
+        run: |
+          CLEAN_ID=$(echo "$RAW_ID" | tr -d ' ' | sed 's/^act_//')
+          echo "Periodo solicitado: $SINCE a $UNTIL"
+          mkdir -p dados_avulso
+          ARQ="dados_avulso/${SINCE}_a_${UNTIL}.json"
+          curl -sS -G "https://graph.facebook.com/v21.0/act_${CLEAN_ID}/insights" \
+            --data-urlencode "level=campaign" \
+            --data-urlencode "fields=campaign_name,spend,impressions,clicks" \
+            --data-urlencode "time_range={\"since\":\"${SINCE}\",\"until\":\"${UNTIL}\"}" \
+            --data-urlencode "access_token=${TOKEN}" \
+            -o "$ARQ"
+          if grep -q '"error"' "$ARQ"; then
+            echo "A Meta API retornou erro:"
+            cat "$ARQ"
+            exit 1
+          fi
+          echo "Salvo em $ARQ"
+
+      - name: Gerar PDF
+        env:
+          PASTA_DADOS: dados_avulso
+        run: python gerar_relatorio.py
+
+      - name: Enviar por e-mail e Telegram
+        env:
+          EMAIL_REMETENTE: ${{ secrets.EMAIL_REMETENTE }}
+          EMAIL_SENHA_APP: ${{ secrets.EMAIL_SENHA_APP }}
+          EMAIL_DESTINO: ${{ secrets.EMAIL_DESTINO }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python enviar_relatorio.py
