@@ -1,68 +1,352 @@
-name: Relatorio diario de trafego
-
+name: Relatorio Meta
 on:
+  workflow_dispatch:
   schedule:
-    - cron: "0 10 * * *"   # 10:00 UTC = 07:00 na Bahia
-  workflow_dispatch: {}
-
+    - cron: '15 10 * * *'
+    - cron: '15 21 * * *'
 permissions:
   contents: write
-
 jobs:
   relatorio:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Instalar dependencias
-        run: pip install requests reportlab
-
-      - name: Coletar dados da Meta API
+      - name: Instalar bibliotecas
+        run: pip install --quiet reportlab matplotlib requests
+      - name: Gerar e enviar relatorio
         env:
           RAW_ID: ${{ secrets.AD_ACCOUNT_ID }}
           TOKEN: ${{ secrets.META_TOKEN }}
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GMAIL_USER: ${{ secrets.EMAIL_REMETENTE }}
+          GMAIL_PASS: ${{ secrets.EMAIL_SENHA_APP }}
+          EMAIL_TO: ${{ secrets.EMAIL_DESTINO }}
         run: |
-          CLEAN_ID=$(echo "$RAW_ID" | tr -d ' ' | sed 's/^act_//')
-          echo "Coletando conta: act_${CLEAN_ID:0:4}***"
-          mkdir -p dados
-          ARQ="dados/$(date +%Y-%m-%d).json"
-          curl -sS -G "https://graph.facebook.com/v21.0/act_${CLEAN_ID}/insights" \
-            --data-urlencode "level=campaign" \
-            --data-urlencode "fields=campaign_name,spend,impressions,clicks" \
-            --data-urlencode "date_preset=yesterday" \
-            --data-urlencode "access_token=${TOKEN}" \
-            -o "$ARQ"
-          if grep -q '"error"' "$ARQ"; then
-            echo "A Meta API retornou erro:"
-            cat "$ARQ"
-            exit 1
-          fi
-          echo "Salvo em $ARQ"
+          cat > gerar.py << 'PYEOF'
+          import os, json, datetime, requests
+          import matplotlib; matplotlib.use("Agg")
+          import matplotlib.pyplot as plt
+          from reportlab.lib.pagesizes import A4
+          from reportlab.pdfgen import canvas
+          from reportlab.lib import colors
+          from reportlab.lib.utils import ImageReader
+          from reportlab.pdfbase.pdfmetrics import stringWidth
 
-      - name: Gerar PDF
-        env:
-          PASTA_DADOS: dados
-        run: python gerar_relatorio.py
+          # ---------- config ----------
+          ID = os.environ["RAW_ID"].strip().replace("act_","")
+          TK = os.environ["TOKEN"].strip()
+          B  = f"https://graph.facebook.com/v21.0/act_{ID}"
+          agora_utc = datetime.datetime.utcnow()
+          local = agora_utc - datetime.timedelta(hours=3)  # Bahia
+          if agora_utc.hour < 15:
+              preset, sufixo, rotulo = "yesterday", "manha", "FECHAMENTO DE ONTEM"
+              data_ref = (local - datetime.timedelta(days=1)).date()
+          else:
+              preset, sufixo, rotulo = "today", "tarde", f"PARCIAL {local.strftime('%Hh%M')}"
+              data_ref = local.date()
+          fim_pago = datetime.date(2026,10,1)
+          dias_rest = max(0,(fim_pago - local.date()).days + 1)
+          def meta_dia(d):
+              if d <= datetime.date(2026,9,16): return 500
+              if d <= datetime.date(2026,9,23): return 1000
+              if d <= datetime.date(2026,9,30): return 1800
+              if d == fim_pago: return 4000
+              return 0
+          def get(url, params):
+              params = dict(params); params["access_token"] = TK
+              r = requests.get(url, params=params, timeout=60).json()
+              return r.get("data", [])
+          def f(x):
+              try: return float(x)
+              except: return 0.0
+          def brl(v): return ("R$ %.2f" % v).replace(".", ",")
+          def act(row, tipo):
+              for a in row.get("actions", []):
+                  if a.get("action_type") == tipo: return f(a.get("value"))
+              return 0.0
 
-      - name: Enviar por e-mail e Telegram
-        env:
-          EMAIL_REMETENTE: ${{ secrets.EMAIL_REMETENTE }}
-          EMAIL_SENHA_APP: ${{ secrets.EMAIL_SENHA_APP }}
-          EMAIL_DESTINO: ${{ secrets.EMAIL_DESTINO }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python enviar_relatorio.py
+          # ---------- dados: dia ----------
+          FLDS = "campaign_name,spend,impressions,reach,frequency,cpm,ctr,cpc,inline_link_clicks,actions"
+          dia_camp = get(f"{B}/insights", {"level":"campaign","fields":FLDS,"date_preset":preset,"limit":200})
+          dia_tot  = get(f"{B}/insights", {"level":"account","fields":"spend,impressions,reach,frequency,cpm,inline_link_clicks","date_preset":preset})
+          T = dia_tot[0] if dia_tot else {}
+          # ---------- dados: semana ----------
+          desde = (data_ref - datetime.timedelta(days=6)).isoformat(); ate = data_ref.isoformat()
+          tr = json.dumps({"since":desde,"until":ate})
+          sem_dias = get(f"{B}/insights", {"level":"account","fields":"spend,reach,frequency","time_range":tr,"time_increment":1,"limit":10})
+          sem_tot  = get(f"{B}/insights", {"level":"account","fields":"spend,reach,frequency,inline_link_clicks","time_range":tr})
+          S = sem_tot[0] if sem_tot else {}
+          sem_camp = get(f"{B}/insights", {"level":"campaign","fields":FLDS,"time_range":tr,"limit":200})
+          idade = get(f"{B}/insights", {"level":"account","fields":"inline_link_clicks,impressions","breakdowns":"age,gender","time_range":tr,"limit":200})
+          video = get(f"{B}/insights", {"level":"account","fields":"video_play_actions,video_p25_watched_actions,video_p50_watched_actions,video_p75_watched_actions,video_p100_watched_actions","time_range":tr})
+          ads_st = get(f"{B}/ads", {"fields":"name,effective_status","limit":200})
 
-      - name: Guardar PDF no repositorio
+          # ---------- classificacao e semaforo ----------
+          def bucket(n):
+              n=n.lower()
+              if "fsa" in n or "feira" in n or "regi" in n: return "feira"
+              if "[ba]" in n or "(ba)" in n or " ba " in n: return "ba"
+              return "polo"
+          def objetivo(n):
+              n=n.lower()
+              return "alcance" if "[alc]" in n else "cliques"
+          def linha(rowset):
+              out=[]
+              for r in rowset:
+                  nome=r.get("campaign_name","?"); sp=f(r.get("spend")); rc=f(r.get("reach")); cl=f(r.get("inline_link_clicks"))
+                  if sp<1: continue
+                  if objetivo(nome)=="alcance":
+                      cpr = sp/rc*1000 if rc else 99; un="/mil alc."
+                      cor = "verde" if cpr<3 else ("amarelo" if cpr<=6 else "vermelho")
+                  else:
+                      cpr = sp/cl if cl else 99; un="/clique"
+                      cor = "verde" if cpr<1 else ("amarelo" if cpr<=3 else "vermelho")
+                  out.append({"nome":nome[:34],"sp":sp,"cpr":cpr,"un":un,"cor":cor,"b":bucket(nome)})
+              return sorted(out,key=lambda x:-x["sp"])
+          L_dia = linha(dia_camp); L_sem = linha(sem_camp)
+          # geografia por classificacao de campanha (semana)
+          gsem={"feira":0,"polo":0,"ba":0}
+          for r in L_sem: gsem[r["b"]]+=r["sp"]
+          tot_g=sum(gsem.values()) or 1
+          # status meta
+          ativos=sum(1 for a in ads_st if a.get("effective_status")=="ACTIVE")
+          analise=sum(1 for a in ads_st if a.get("effective_status") in ("PENDING_REVIEW","IN_PROCESS"))
+          reprov=[a.get("name","?")[:40] for a in ads_st if a.get("effective_status") in ("DISAPPROVED","WITH_ISSUES")]
+          # acoes automaticas
+          acoes=[]
+          for r in L_dia:
+              if r["cor"]=="vermelho": acoes.append(("vermelho",f"PAUSAR {r['nome']}",f"custo {brl(r['cpr'])}{r['un']} • {brl(r['sp'])} no periodo"))
+          verdes=[r for r in L_dia if r["cor"]=="verde"]
+          if verdes:
+              m=min(verdes,key=lambda x:x["cpr"])
+              acoes.append(("verde",f"ESCALAR {m['nome']}",f"melhor custo: {brl(m['cpr'])}{m['un']}"))
+          g_dia=f(T.get("spend")); md=meta_dia(data_ref)
+          if md and g_dia < 0.8*md: acoes.append(("amarelo",f"SUBIR RITMO: {brl(g_dia)} de {brl(md)} planejados","curva da semana pede mais verba"))
+          if analise: acoes.append(("amarelo",f"{analise} anuncio(s) EM ANALISE na Meta","conferir rotulo Propaganda Eleitoral + CNPJ"))
+          if reprov: acoes.insert(0,("vermelho",f"{len(reprov)} anuncio(s) REPROVADO(S)","; ".join(reprov)))
+          acoes=acoes[:4] or [("verde","Nenhuma acao urgente","tudo dentro das regras hoje")]
+
+          # ---------- graficos ----------
+          LAR="#E84E1B";TE="#5FC4CB";AM="#F6C445";VD="#2E9E4F";VM="#D93025"
+          CMAP={"verde":VD,"amarelo":AM,"vermelho":VM}
+          plt.rcParams["font.family"]="DejaVu Sans"
+          def g_cpr(rows,fn):
+              rows=rows[:8]
+              fig,ax=plt.subplots(figsize=(6.4,3.0),dpi=180)
+              y=range(len(rows))[::-1]
+              ax.barh(list(y),[min(r["cpr"],12) for r in rows],color=[CMAP[r["cor"]] for r in rows],height=.6,zorder=3)
+              for yi,r in zip(y,rows): ax.text(min(r["cpr"],12)+.15,yi,brl(r["cpr"])+r["un"],va="center",fontsize=8,fontweight="bold")
+              ax.set_yticks(list(y)); ax.set_yticklabels([r["nome"][:26] for r in rows],fontsize=8)
+              ax.set_xlim(0,14); ax.spines[["top","right","left"]].set_visible(False)
+              ax.tick_params(left=False,bottom=False,labelbottom=False); ax.grid(axis="x",color="#EEE",zorder=0)
+              fig.tight_layout(pad=.3); fig.savefig(fn,transparent=True); plt.close(fig)
+          g_cpr(L_dia,"c_dia.png"); g_cpr(L_sem,"c_sem.png")
+          fig,ax=plt.subplots(figsize=(3.2,3.2),dpi=180)
+          vals=[gsem["ba"],gsem["polo"],gsem["feira"]]
+          if sum(vals)>0:
+              ax.pie(vals,colors=[VM,AM,VD],startangle=90,counterclock=False,wedgeprops=dict(width=.42,edgecolor="white",linewidth=2))
+          ax.text(0,.08,f"{round(gsem['feira']/tot_g*100)}%",ha="center",fontsize=22,fontweight="bold",color=VD)
+          ax.text(0,-.24,"em Feira\n+ regiao",ha="center",fontsize=8.5,color="#555")
+          fig.tight_layout(pad=.2); fig.savefig("c_geo.png",transparent=True); plt.close(fig)
+          fig,ax=plt.subplots(figsize=(6.6,2.3),dpi=180)
+          ds=[r["date_start"][5:] for r in sem_dias]; gs=[f(r.get("spend")) for r in sem_dias]
+          ms=[meta_dia(datetime.date.fromisoformat(r["date_start"])) for r in sem_dias]
+          ax.bar(range(len(ds)),gs,color=TE,width=.55,zorder=3,label="Realizado")
+          ax.plot(range(len(ds)),ms,color=LAR,lw=2.2,ls="--",zorder=4,label="Planejado")
+          for i,v in enumerate(gs): ax.text(i,v+max(gs+[1])*.03,f"{v:.0f}",ha="center",fontsize=8)
+          ax.set_xticks(range(len(ds))); ax.set_xticklabels(ds,fontsize=8.5)
+          ax.spines[["top","right","left"]].set_visible(False); ax.tick_params(left=False,labelleft=False,bottom=False)
+          ax.grid(axis="y",color="#EEE",zorder=0); ax.legend(loc="upper left",fontsize=8,frameon=False)
+          fig.tight_layout(pad=.3); fig.savefig("c_curva.png",transparent=True); plt.close(fig)
+          fig,ax=plt.subplots(figsize=(3.3,2.3),dpi=180)
+          fa={}
+          for r in idade:
+              k=r.get("age","?"); g=r.get("gender","?"); fa.setdefault(k,{"female":0,"male":0})
+              if g in ("female","male"): fa[k][g]+=f(r.get("inline_link_clicks"))
+          ks=sorted(fa.keys())[:6]
+          if ks:
+              x=range(len(ks)); w=.38
+              ax.bar([i-w/2 for i in x],[fa[k]["female"] for k in ks],width=w,color=LAR,label="Mulheres",zorder=3)
+              ax.bar([i+w/2 for i in x],[fa[k]["male"] for k in ks],width=w,color=TE,label="Homens",zorder=3)
+              ax.set_xticks(list(x)); ax.set_xticklabels(ks,fontsize=7.5)
+              ax.legend(fontsize=7,frameon=False)
+          ax.spines[["top","right","left"]].set_visible(False); ax.tick_params(left=False,labelleft=False,bottom=False)
+          ax.grid(axis="y",color="#EEE",zorder=0)
+          fig.tight_layout(pad=.3); fig.savefig("c_ig.png",transparent=True); plt.close(fig)
+          fig,ax=plt.subplots(figsize=(3.2,2.3),dpi=180)
+          V=video[0] if video else {}
+          def vv(k):
+              d=V.get(k,[]); return f(d[0].get("value")) if d else 0
+          plays=vv("video_play_actions") or 1
+          pts=[100,vv("video_p25_watched_actions")/plays*100,vv("video_p50_watched_actions")/plays*100,vv("video_p75_watched_actions")/plays*100,vv("video_p100_watched_actions")/plays*100]
+          ax.bar(range(5),pts,color=[TE,TE,AM,AM,LAR],width=.55,zorder=3)
+          for i,v in enumerate(pts): ax.text(i,v+3,f"{v:.0f}%",ha="center",fontsize=8,fontweight="bold")
+          ax.set_xticks(range(5)); ax.set_xticklabels(["play","25%","50%","75%","100%"],fontsize=8)
+          ax.set_ylim(0,118); ax.spines[["top","right","left"]].set_visible(False)
+          ax.tick_params(left=False,labelleft=False,bottom=False); ax.grid(axis="y",color="#EEE",zorder=0)
+          fig.tight_layout(pad=.3); fig.savefig("c_ret.png",transparent=True); plt.close(fig)
+
+          # ---------- PDF ----------
+          W,H=A4
+          LARc=colors.HexColor(LAR);TEc=colors.HexColor(TE);AMc=colors.HexColor(AM)
+          VDc=colors.HexColor(VD);VMc=colors.HexColor(VM)
+          BEGE=colors.HexColor("#FAF7F3");CZ=colors.HexColor("#5A5A5A");AMB=colors.HexColor("#8A6A00")
+          CMAPc={"verde":VDc,"amarelo":AMc,"vermelho":VMc}
+          os.makedirs("relatorios",exist_ok=True)
+          arq=f"relatorios/relatorio_{data_ref.isoformat()}_{sufixo}.pdf"
+          c=canvas.Canvas(arq,pagesize=A4)
+          def banner(t,s):
+              c.setFillColor(BEGE);c.rect(0,0,W,H,stroke=0,fill=1)
+              c.setFillColor(LARc);c.rect(0,H-78,W,78,stroke=0,fill=1)
+              c.setFillColor(colors.white);c.setFont("Helvetica-Bold",8.5)
+              c.drawString(40,H-25,"CAMPANHA DANI LACERDA 7075 — TRAFEGO PAGO")
+              c.setFont("Helvetica-Bold",16);c.drawString(40,H-48,t)
+              c.setFont("Helvetica",9);c.drawString(40,H-64,s)
+              c.setFillColor(AMc);c.roundRect(W-198,H-58,160,20,10,stroke=0,fill=1)
+              c.setFillColor(colors.HexColor("#5A3B00"));c.setFont("Helvetica-Bold",8.3)
+              c.drawCentredString(W-118,H-52,f"{dias_rest} DIAS DE MIDIA PAGA")
+              c.setFillColor(colors.HexColor("#1E8A3C"));c.rect(0,H-83,W,5,stroke=0,fill=1)
+              c.setFillColor(AMc);c.rect(W*.62,H-83,W*.38,5,stroke=0,fill=1)
+          def rodape(x=None):
+              c.setFillColor(colors.HexColor("#333"));c.rect(0,0,W,28,stroke=0,fill=1)
+              c.setFillColor(colors.white);c.setFont("Helvetica-Bold",7.2)
+              c.drawString(40,17,'CONFORMIDADE TSE: rotulo "Propaganda Eleitoral" + CNPJ NA PECA • contratacao pelo CNPJ da campanha')
+              c.setFillColor(AMc);c.drawString(40,6,x or "ULTIMO DIA DE MIDIA PAGA: 01/OUT • 02-04/out: organico + base WhatsApp")
+          def card(x,y,w,h,v,r,cor,sub=None):
+              c.setFillColor(colors.white);c.setStrokeColor(colors.HexColor("#E8E4DE"))
+              c.roundRect(x,y,w,h,7,stroke=1,fill=1)
+              c.setFillColor(cor);c.setFont("Helvetica-Bold",14);c.drawCentredString(x+w/2,y+h-23,v)
+              c.setFillColor(CZ);c.setFont("Helvetica",7.2);c.drawCentredString(x+w/2,y+h-35,r)
+              if sub:c.setFont("Helvetica-Bold",6.8);c.setFillColor(cor);c.drawCentredString(x+w/2,y+6,sub)
+          def dot(x,y,cor,r=4):c.setFillColor(cor);c.circle(x,y,r,stroke=0,fill=1)
+          def sec(x,y,t,s=11):c.setFillColor(colors.HexColor("#222"));c.setFont("Helvetica-Bold",s);c.drawString(x,y,t)
+          # P1 — dia
+          banner(f"VISAO DO DIA — {data_ref.strftime('%d/%m')} · {rotulo}","o que decidir agora")
+          kw,kh,gp=87,56,6;x0=40;y0=H-83-12-kh
+          g_sem_v=f(S.get("spend"));fr_sem=f(S.get("frequency"))
+          card(x0,y0,kw,kh,brl(g_dia),"GASTO",LARc,f"meta {brl(md)}" if md else "MIDIA PAGA VEDADA")
+          card(x0+kw+gp,y0,kw,kh,f"{f(T.get('reach'))/1000:.0f} mil","ALCANCE",colors.HexColor("#333"))
+          card(x0+2*(kw+gp),y0,kw,kh,f"{fr_sem:.1f}".replace(".",","),"FREQUENCIA (7d)",TEc,"meta final 5-6")
+          card(x0+3*(kw+gp),y0,kw,kh,brl(f(T.get("cpm"))),"CPM",VDc if f(T.get("cpm"))<5 else AMc)
+          card(x0+4*(kw+gp),y0,kw,kh,str(ativos),"ANUNCIOS ATIVOS",VDc)
+          card(x0+5*(kw+gp),y0,kw,kh,str(analise+len(reprov)),"EM ANALISE/REPROV.",AMc if not reprov else VMc,"ver acoes")
+          ah=26+len(acoes)*24;ay=y0-12-ah
+          c.setFillColor(colors.HexColor("#FFF1EC"));c.setStrokeColor(LARc)
+          c.roundRect(40,ay,W-80,ah,8,stroke=1,fill=1)
+          c.setFillColor(VMc);c.setFont("Helvetica-Bold",11);c.drawString(54,ay+ah-18,"ACOES")
+          yy=ay+ah-36
+          for cor,t,s in acoes:
+              dot(60,yy+3,CMAPc[cor],4.5)
+              c.setFont("Helvetica-Bold",9.2);c.setFillColor(colors.HexColor("#222"));c.drawString(72,yy,t[:78])
+              c.setFont("Helvetica",8);c.setFillColor(CZ);c.drawString(72,yy-10,s[:90]);yy-=24
+          sy=ay-14
+          sec(40,sy-4,"CUSTO POR RESULTADO — hoje")
+          c.setFont("Helvetica",7.2);c.setFillColor(CZ)
+          c.drawString(40,sy-14,"alcance: R$/1.000 alcancados • trafego/leads: R$/clique • semaforo pela regra do teto")
+          c.drawImage(ImageReader("c_dia.png"),32,sy-190,width=352,height=162,mask="auto")
+          sec(400,sy-4,"VERBA POR TERRITORIO (7d)")
+          c.drawImage(ImageReader("c_geo.png"),398,sy-168,width=148,height=148,mask="auto")
+          c.setFont("Helvetica",7.3)
+          for i,(t,cor) in enumerate([(f"Bahia dispersa — {brl(gsem['ba'])}",VMc),(f"Cidades-polo — {brl(gsem['polo'])}",AMc),(f"Feira+regiao — {brl(gsem['feira'])}",VDc)]):
+              dot(408,sy-178-i*11+2,cor,3.5);c.setFillColor(colors.HexColor("#333"));c.drawString(417,sy-178-i*11,t)
+          rodape();c.showPage()
+          # P2 — semana
+          banner(f"VISAO DA SEMANA — {desde[5:]} a {ate[5:]}","acumulado e curva")
+          y0=H-83-12-kh
+          cl_sem=f(S.get("inline_link_clicks"))
+          card(x0,y0,kw,kh,brl(g_sem_v),"GASTO 7 DIAS",LARc)
+          card(x0+kw+gp,y0,kw,kh,f"{f(S.get('reach'))/1000:.0f} mil","ALCANCE UNICO",colors.HexColor("#333"))
+          card(x0+2*(kw+gp),y0,kw,kh,f"{fr_sem:.1f}".replace(".",","),"FREQUENCIA",TEc)
+          card(x0+3*(kw+gp),y0,kw,kh,f"{cl_sem:.0f}","CLIQUES",VDc)
+          pct_f=round(gsem["feira"]/tot_g*100)
+          card(x0+4*(kw+gp),y0,kw,kh,f"{pct_f}%","VERBA EM FEIRA+REG.",VDc if pct_f>=50 else VMc,"meta >= 70%")
+          card(x0+5*(kw+gp),y0,kw,kh,brl(g_sem_v/cl_sem) if cl_sem else "—","CUSTO/CLIQUE MEDIO",VDc)
+          sy=y0-16
+          sec(40,sy-4,"PLANEJADO x REALIZADO")
+          c.drawImage(ImageReader("c_curva.png"),32,sy-140,width=530,height=126,mask="auto")
+          ry=sy-158
+          sec(40,ry-4,"QUEM CLICA (idade x genero)",10)
+          c.drawImage(ImageReader("c_ig.png"),32,ry-136,width=180,height=122,mask="auto")
+          sec(228,ry-4,"RETENCAO DE VIDEO (semana)",10)
+          c.drawImage(ImageReader("c_ret.png"),222,ry-136,width=172,height=122,mask="auto")
+          sec(410,ry-4,"RANKING (7d)",10)
+          ty=ry-22
+          for r in L_sem[:6]:
+              dot(416,ty+3,CMAPc[r["cor"]],3.5)
+              c.setFont("Helvetica-Bold",7.3);c.setFillColor(colors.HexColor("#222"));c.drawString(424,ty,r["nome"][:22])
+              c.setFont("Helvetica",7.3);c.setFillColor(CZ);c.drawString(424,ty-9,f"{brl(r['sp'])} • {brl(r['cpr'])}{r['un']}")
+              ty-=22
+          ty2=ry-160
+          sec(40,ty2,"RANKING DA SEMANA — todas")
+          ty2-=12
+          c.setFont("Helvetica-Bold",7.4);c.setFillColor(CZ)
+          c.drawString(60,ty2,"CAMPANHA");c.drawString(300,ty2,"GASTO");c.drawString(370,ty2,"CUSTO/RESULTADO")
+          for r in L_sem[:9]:
+              ty2-=18
+              c.setFillColor(colors.white);c.setStrokeColor(colors.HexColor("#E8E4DE"))
+              c.roundRect(46,ty2-5,W-92,16,4,stroke=1,fill=1)
+              dot(56,ty2+3,CMAPc[r["cor"]],4)
+              c.setFillColor(colors.HexColor("#222"));c.setFont("Helvetica-Bold",7.8);c.drawString(66,ty2,r["nome"])
+              c.setFont("Helvetica",7.8);c.drawString(300,ty2,brl(r["sp"]));c.drawString(370,ty2,brl(r["cpr"])+r["un"])
+          rodape("SEGUNDA-FEIRA de manha: esta pagina e o FECHAMENTO OFICIAL da semana");c.showPage()
+          # P3 — dicionario
+          banner("DICIONARIO — entenda em 1 minuto","toda sigla, em linguagem de gente")
+          termos=[("ALCANCE","Pessoas diferentes que viram. Cada uma conta 1 vez."),
+           ("IMPRESSOES","Vezes que apareceu. A mesma pessoa 3x = 3 impressoes."),
+           ("FREQUENCIA","Media de vezes que CADA pessoa viu. E ela que grava o 7075. Meta: 5-6 na reta final."),
+           ("CPM","Custo por mil impressoes — o aluguel do outdoor digital. Abaixo de R$ 5, otimo."),
+           ("CTR","De cada 100 que viram, quantas clicaram."),
+           ("CPC","Quanto custa cada clique."),
+           ("CPR / CUSTO POR RESULTADO","Quanto custa o que a campanha quer de verdade: 1 clique, 1 pessoa no grupo, 1.000 alcancados. Manda no semaforo."),
+           ("LEAD","Pessoa que clicou para o grupo do WhatsApp — a base ativavel de 02 a 04/out."),
+           ("RETENCAO","% do video assistido. Se cai nos 3s, o problema e o comeco."),
+           ("SEMAFORO","Verde = escalar • Amarelo = ajustar • Vermelho = pausar."),
+           ("FADIGA","A pessoa viu demais e parou de reagir. Remedio: trocar criativo, manter publico."),
+           ("EM ANALISE","Anuncio esperando aprovacao da Meta. Mais de 24h = conferir rotulo eleitoral.")]
+          ch=50
+          for i,(t,d) in enumerate(termos):
+              cx=[40,308][i%2];cy=H-83-22-(i//2)*(ch+8)-ch
+              c.setFillColor(colors.white);c.setStrokeColor(colors.HexColor("#E8E4DE"))
+              c.roundRect(cx,cy,250,ch,7,stroke=1,fill=1)
+              c.setFillColor(LARc);c.setFont("Helvetica-Bold",8.8);c.drawString(cx+12,cy+ch-15,t)
+              c.setFillColor(colors.HexColor("#444"));c.setFont("Helvetica",7.6)
+              words=d.split();line="";ly=cy+ch-27
+              for w2 in words:
+                  if stringWidth(line+" "+w2,"Helvetica",7.6)>226: c.drawString(cx+12,ly,line);ly-=9.5;line=w2
+                  else: line=(line+" "+w2).strip()
+              c.drawString(cx+12,ly,line)
+          rodape();c.showPage();c.save()
+          print("PDF:",arq)
+
+          # ---------- envios ----------
+          tg_t=os.environ.get("TG_TOKEN","").strip();tg_c=os.environ.get("TG_CHAT","").strip()
+          if tg_t and tg_c:
+              try:
+                  with open(arq,"rb") as fh:
+                      requests.post(f"https://api.telegram.org/bot{tg_t}/sendDocument",
+                          data={"chat_id":tg_c,"caption":f"Relatorio 7075 — {data_ref.strftime('%d/%m')} ({rotulo})"},
+                          files={"document":fh},timeout=60)
+                  print("telegram ok")
+              except Exception as e: print("telegram falhou:",e)
+          gu=os.environ.get("GMAIL_USER","").strip();gp2=os.environ.get("GMAIL_PASS","").strip()
+          to=os.environ.get("EMAIL_TO","").strip() or gu
+          if gu and gp2:
+              try:
+                  import smtplib
+                  from email.message import EmailMessage
+                  m=EmailMessage();m["Subject"]=f"Relatorio 7075 — {data_ref.strftime('%d/%m')} ({rotulo})"
+                  m["From"]=gu;m["To"]=to;m.set_content("Relatorio em anexo. Acoes na pagina 1.")
+                  with open(arq,"rb") as fh: m.add_attachment(fh.read(),maintype="application",subtype="pdf",filename=os.path.basename(arq))
+                  s=smtplib.SMTP_SSL("smtp.gmail.com",465);s.login(gu,gp2);s.send_message(m);s.quit()
+                  print("email ok")
+              except Exception as e: print("email falhou:",e)
+          PYEOF
+          python gerar.py
+      - name: Salvar no repositorio
         run: |
-          mkdir -p relatorios
-          cp relatorio.pdf "relatorios/relatorio_$(date +%Y-%m-%d).pdf"
-          git config user.name "bot-relatorio"
-          git config user.email "bot@relatorio"
-          git add relatorios/
-          git commit -m "Relatorio $(date +%Y-%m-%d)" || echo "nada novo"
+          git config user.name "relatorio-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add relatorios
+          git commit -m "Relatorio $(date +%F)" || echo "sem mudancas"
           git push
