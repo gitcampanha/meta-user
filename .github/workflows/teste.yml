@@ -5,5 +5,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Chamar API
+        env:
+          RAW_ID: ${{ secrets.AD_ACCOUNT_ID }}
+          TOKEN: ${{ secrets.META_TOKEN }}
         run: |
-          curl -s "https://graph.facebook.com/v21.0/act_${{ secrets.AD_ACCOUNT_ID }}/insights?fields=spend,impressions,reach&date_preset=maximum&access_token=${{ secrets.META_TOKEN }}"
+          CLEAN_ID=$(echo "$RAW_ID" | tr -d ' ' | sed 's/^act_//')
+          echo "Testando conta: act_${CLEAN_ID:0:4}***"
+          echo "--- Teste 1: dados da conta ---"
+          curl -s "https://graph.facebook.com/v21.0/act_${CLEAN_ID}?fields=name,account_status,currency&access_token=${TOKEN}"
+          echo ""
+          echo "--- Teste 2: insights ---"
+          curl -s "https://graph.facebook.com/v21.0/act_${CLEAN_ID}/insights?fields=spend,impressions,reach&date_preset=maximum&access_token=${TOKEN}"
+          echo ""
+          echo "--- Teste 3: quem sou eu (valida o token) ---"
+          curl -s "https://graph.facebook.com/v21.0/me?access_token=${TOKEN}"
