@@ -1,0 +1,45 @@
+{
+  "additional_budget_brl": 100000,
+  "budget_scope": "Adicional; inclui midia, tributos e servicos",
+  "budget_start_at": null,
+  "whatsapp": {
+    "entries_reported": 18,
+    "since": "2026-09-06",
+    "until": "2026-09-11",
+    "exits": null,
+    "attribution_verified": false,
+    "dates_confirmed": false,
+    "daily_entries": [
+      {
+        "date": "2026-09-06",
+        "weekday": "Domingo",
+        "entries": 9
+      },
+      {
+        "date": "2026-09-07",
+        "weekday": "Segunda",
+        "entries": 0
+      },
+      {
+        "date": "2026-09-08",
+        "weekday": "Terca",
+        "entries": 1
+      },
+      {
+        "date": "2026-09-09",
+        "weekday": "Quarta",
+        "entries": 5
+      },
+      {
+        "date": "2026-09-10",
+        "weekday": "Quinta",
+        "entries": 3
+      },
+      {
+        "date": "2026-09-11",
+        "weekday": "Sexta",
+        "entries": 0
+      }
+    ]
+  }
+}
